@@ -15,3 +15,6 @@ jobs:
         with:
           scandir: "."
           severity: warning
+          # devc.zsh and devc.fish use shell-specific syntax that ShellCheck
+          # (a bash linter) can't reason about. They're excluded from CI.
+          ignore_names: devc.zsh devc.fish
