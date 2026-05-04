@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# devc — open VS Code dev containers from your terminal, with an arrow-key fuzzy picker.
+#
+# Usage:
+#   devc                     # picker of every project that has a .devcontainer/
+#   devc <name>              # open exact match; picker if name matches several
+#   devc -n <name>           # dry-run — print URI but don't launch
+#   devc --editor cursor     # use cursor instead of code (auto-detected by default)
+#   devc -h | --help
+#   devc --version
+#
+# Search roots:
+#   - DEVC_ROOTS: colon-separated list of dirs to search (preferred)
+#   - DEVC_ROOT:  single dir (back-compat)
+#   - default:    $HOME/src
+#
+# Editor detection order (when --editor is omitted):
+#   $DEVC_EDITOR > cursor > code-insiders > code
+#
+# Repo: https://github.com/robert-inviol/devc
+
+set -euo pipefail
+
+VERSION="0.2.0"
+
+usage() {
+  cat <<'HELP'
+devc — open VS Code dev containers from your terminal, with an arrow-key fuzzy picker.
+
+Usage:
+  devc                     Picker over every project that has a .devcontainer/
+  devc <name>              Open exact match; picker if name matches several
+  devc -n <name>           Dry-run — print URI but don't launch
+  devc --editor cursor     Use cursor instead of code (auto-detected by default)
+  devc -h | --help
+  devc --version
+
+Search roots:
+  DEVC_ROOTS  colon-separated list of dirs to search (preferred)
+  DEVC_ROOT   single dir (back-compat)
+  default     $HOME/src
+
+Editor detection (when --editor is omitted):
+  $DEVC_EDITOR > cursor > code-insiders > code
+
+Repo: https://github.com/robert-inviol/devc
+HELP
+}
+
+# ----------------------------------------------------------------------------
+# Discovery
+# ----------------------------------------------------------------------------
+
+resolve_roots() {
+  if [ -n "${DEVC_ROOTS:-}" ]; then
+    printf '%s\n' "$DEVC_ROOTS" | tr ':' '\n'
+  elif [ -n "${DEVC_ROOT:-}" ]; then
+    printf '%s\n' "$DEVC_ROOT"
+  else
+    printf '%s\n' "$HOME/src"
+  fi
+}
+
+# Print "<name>\t<absolute_path>" for every project found under any search root,
+# sorted, deduplicated.
+discover() {
+  local root
+  while IFS= read -r root; do
+    [ -d "$root" ] || continue
+    find "$root" -mindepth 2 -maxdepth 3 -type f -name 'devcontainer.json' \
+         -path '*/.devcontainer/*' 2>/dev/null \
+      | while IFS= read -r f; do
+          local proj_dir
+          proj_dir=$(dirname "$(dirname "$f")")
+          printf '%s\t%s\n' "$(basename "$proj_dir")" "$proj_dir"
+        done
+  done < <(resolve_roots) | sort -u
+}
+
+# ----------------------------------------------------------------------------
+# Open
+# ----------------------------------------------------------------------------
+
+# Hex-encode a string (no spaces or newlines) for the vscode-remote URI.
+hex_encode() {
+  printf '%s' "$1" | od -A n -t x1 | tr -d ' \n'
+}
+
+resolve_editor() {
+  if [ -n "${1:-}" ]; then
+    printf '%s' "$1"; return
+  fi
+  if [ -n "${DEVC_EDITOR:-}" ]; then
+    printf '%s' "$DEVC_EDITOR"; return
+  fi
+  for candidate in cursor code-insiders code; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s' "$candidate"; return
+    fi
+  done
+  printf 'code'  # let the error surface from `code` not being on PATH
+}
+
+open_project() {
+  local proj_dir="$1"
+  local editor="$2"
+  local dry_run="$3"
+
+  local proj_name
+  proj_name=$(basename "$proj_dir")
+
+  local hex
+  hex=$(hex_encode "$proj_dir")
+
+  # In-container, VS Code mounts the project at /workspaces/<basename>.
+  local container_path="/workspaces/$proj_name"
+
+  # Prefer a *.code-workspace at the project root, fall back to the folder.
+  local workspace_file=""
+  while IFS= read -r f; do
+    workspace_file="$f"
+    break
+  done < <(find "$proj_dir" -maxdepth 1 -name '*.code-workspace' 2>/dev/null)
+
+  local target="$container_path"
+  if [ -n "$workspace_file" ]; then
+    target="$container_path/$(basename "$workspace_file")"
+  fi
+
+  local uri="vscode-remote://dev-container+${hex}${target}"
+
+  echo "→ $proj_name"
+  echo "  host:      $proj_dir"
+  echo "  container: $target"
+  echo "  editor:    $editor"
+  if [ "$dry_run" = "1" ]; then
+    echo "  uri:       $uri"
+    echo "(dry-run; not launching)"
+    return 0
+  fi
+
+  if ! command -v "$editor" >/dev/null 2>&1; then
+    echo "Error: '$editor' is not on PATH." >&2
+    echo "URI for manual use:" >&2
+    echo "  $uri" >&2
+    exit 1
+  fi
+
+  exec "$editor" --folder-uri "$uri"
+}
+
+# ----------------------------------------------------------------------------
+# Picker
+# ----------------------------------------------------------------------------
+
+# Show a picker over "<name>\t<path>" entries; print the chosen path on stdout.
+# Uses fzf if available (arrow keys + live type-to-filter), falls back to a
+# numbered prompt otherwise. Cancellation yields empty stdout, exit 0.
+pick() {
+  local entries="$1"
+  local header="$2"
+
+  if command -v fzf >/dev/null 2>&1; then
+    local choice
+    choice=$(printf '%s\n' "$entries" \
+      | column -t -s $'\t' \
+      | fzf \
+          --reverse \
+          --border \
+          --height='50%' \
+          --prompt='devc › ' \
+          --header="$header — ↑↓ pick · type to filter · Esc to cancel" \
+          --no-info) || return 0
+    [ -n "$choice" ] || return 0
+    printf '%s' "$choice" | awk '{print $NF}'
+    return 0
+  fi
+
+  echo "$header" >&2
+  printf '%s\n' "$entries" | awk -F'\t' '{printf "  %d) %-32s %s\n", NR, $1, $2}' >&2
+  local pick_input
+  read -rp "Pick a number (or q to cancel): " pick_input
+  case "$pick_input" in q|Q|"") return 0 ;; esac
+  if ! [[ "$pick_input" =~ ^[0-9]+$ ]]; then
+    echo "Invalid pick: $pick_input" >&2
+    return 1
+  fi
+  local chosen
+  chosen=$(printf '%s\n' "$entries" | sed -n "${pick_input}p" | cut -f2)
+  if [ -z "$chosen" ]; then
+    echo "Pick out of range." >&2
+    return 1
+  fi
+  printf '%s' "$chosen"
+}
+
+# ----------------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------------
+
+main() {
+  local query=""
+  local editor=""
+  local dry_run="0"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      --version) echo "devc $VERSION"; exit 0 ;;
+      -n|--dry-run) dry_run="1"; shift ;;
+      --editor)
+        [ $# -ge 2 ] || { echo "--editor needs a value" >&2; exit 2; }
+        editor="$2"; shift 2 ;;
+      --editor=*) editor="${1#--editor=}"; shift ;;
+      --list-names)
+        # Hidden flag — used by shell completion scripts.
+        discover | cut -f1
+        exit 0 ;;
+      -*) echo "Unknown flag: $1" >&2; usage >&2; exit 2 ;;
+      *) query="$1"; shift ;;
+    esac
+  done
+
+  editor=$(resolve_editor "$editor")
+
+  local entries
+  entries=$(discover)
+
+  if [ -z "$entries" ]; then
+    local roots
+    roots=$(resolve_roots | tr '\n' ':' | sed 's/:$//')
+    echo "No projects with .devcontainer/ found under: $roots" >&2
+    echo "Set DEVC_ROOTS=/path1:/path2 (or DEVC_ROOT=/single/path) to point devc elsewhere." >&2
+    exit 1
+  fi
+
+  local matches header
+  if [ -z "$query" ]; then
+    matches="$entries"
+    header="$(printf '%s\n' "$entries" | wc -l) projects"
+  else
+    local query_lower
+    query_lower=$(printf '%s' "$query" | tr '[:upper:]' '[:lower:]')
+    matches=$(printf '%s\n' "$entries" \
+      | awk -F'\t' -v q="$query_lower" '
+          { if (index(tolower($1), q)) print }
+        ')
+    if [ -z "$matches" ]; then
+      echo "No project matched '$query'." >&2
+      echo "Run 'devc' with no args to see all projects." >&2
+      exit 1
+    fi
+    local count
+    count=$(printf '%s\n' "$matches" | wc -l)
+    if [ "$count" -eq 1 ]; then
+      open_project "$(printf '%s' "$matches" | cut -f2)" "$editor" "$dry_run"
+      exit 0
+    fi
+    header="$count match '$query'"
+  fi
+
+  local chosen
+  chosen=$(pick "$matches" "$header") || { echo "cancelled"; exit 0; }
+  [ -n "$chosen" ] || { echo "cancelled"; exit 0; }
+  open_project "$chosen" "$editor" "$dry_run"
+  exit 0
+}
+
+main "$@"
